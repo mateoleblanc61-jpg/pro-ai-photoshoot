@@ -77,23 +77,51 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("⏳ Магия началась... Генерирую фото (30-60 сек)")
     
     try:
+        # 1. Скачиваем фото
         photo_file = await update.message.photo[-1].get_file()
-        image_bytes = await photo_file.download_as_bytearray()
+        image_data_raw = await photo_file.download_as_bytearray()
         
-        model = genai.GenerativeModel(MODEL_NAME)
+        # 2. Преобразуем bytearray в bytes (Исправление ошибки!)
+        image_bytes = bytes(image_data_raw)
+        
+        # 3. Настройка модели
+        model = genai.GenerativeModel('gemini-1.5-pro') 
+        style_prompt = context.user_data.get('style', "High quality portrait")
+        
         prompt = [
-            f"Transform this person into: {context.user_data['style']}. Keep face identical.",
+            f"Transform the person in this photo into: {style_prompt}. "
+            "Keep the facial features and identity identical. Output the result as an image.",
             {"mime_type": "image/jpeg", "data": image_bytes}
         ]
         
-        response = model.generate_content(prompt)
-        image_stream = io.BytesIO(response.parts[0].inline_data.data)
-        
-        await status.delete()
-        await update.message.reply_photo(photo=image_stream, caption="Готово! Хочешь еще? /start")
+        # Настройки безопасности (чтобы не блокировал лица)
+        safety = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+
+        # 4. Запрос к ИИ
+        response = model.generate_content(prompt, safety_settings=safety)
+
+        # 5. Проверка результата
+        if response.parts:
+            # Ищем часть с данными изображения
+            for part in response.parts:
+                if part.inline_data:
+                    generated_img = io.BytesIO(part.inline_data.data)
+                    await status.delete()
+                    await update.message.reply_photo(photo=generated_img, caption="Готово! Хочешь еще? /start")
+                    return ConversationHandler.END
+            
+            await status.edit_text("❌ ИИ прислал ответ, но в нем нет картинки. Попробуй другой стиль.")
+        else:
+            await status.edit_text("❌ Ошибка: Модель заблокировала запрос или не смогла сгенерировать фото.")
+
     except Exception as e:
-        logging.error(e)
-        await status.edit_text("❌ Ошибка. Попробуй другое фото.")
+        logging.error(f"Ошибка: {e}")
+        await status.edit_text(f"❌ Техническая ошибка: {str(e)[:100]}")
     
     return ConversationHandler.END
 
