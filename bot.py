@@ -5,7 +5,14 @@ import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    ReplyKeyboardMarkup, 
+    ReplyKeyboardRemove,
+    WebAppInfo
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -16,7 +23,7 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK ---
+# --- 1. ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK (RENDER.COM) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -33,6 +40,9 @@ threading.Thread(target=run_health_check, daemon=True).start()
 # --- 2. КОНФИГУРАЦИЯ ---
 logging.basicConfig(level=logging.INFO)
 genai.configure(api_key=os.getenv("GEMINI_KEY"))
+
+# Используем gemini-1.5-flash для стабильности и скорости
+MODEL_NAME = 'gemini-1.5-flash'
 
 SYSTEM_INSTRUCTION = (
     "You are a professional AI Photo Editor. "
@@ -52,6 +62,14 @@ USER_PHOTO, STYLE_PHOTO, EDITING = range(3)
 # --- 3. КЛАВИАТУРЫ ---
 
 def get_main_menu():
+    web_app_url = os.getenv("WEBAPP_URL", "https://your-mini-app-url.vercel.app")
+    keyboard = [
+        [InlineKeyboardButton("🎨 Открыть Фотостудию (Mini App)", web_app=WebAppInfo(url=web_app_url))],
+        [InlineKeyboardButton("🚀 Начать в чате", callback_data="start_chat_flow")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_reply_keyboard():
     return ReplyKeyboardMarkup([['🚀 Начать фотосессию']], resize_keyboard=True)
 
 def get_cancel_inline():
@@ -64,11 +82,24 @@ def get_editing_options():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text(
-        "👋 Добро пожаловать в ИИ-фотостудию!\nПришли свое лицо, выбери стиль, а я сделаю магию.",
-        reply_markup=get_main_menu()
+    web_app_url = os.getenv("WEBAPP_URL", "https://your-mini-app-url.vercel.app")
+    
+    welcome_text = (
+        "👋 Добро пожаловать в ИИ-фотостудию!\n\n"
+        "Вы можете использовать наш современный **Mini App** для удобной загрузки "
+        "или продолжить прямо здесь, в чате."
     )
+    
+    await update.message.reply_text(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
     return ConversationHandler.END
+
+async def start_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "Окей, работаем в чате! Нажми кнопку ниже или пришли фото своего лица.",
+        reply_markup=get_reply_keyboard()
+    )
 
 async def init_photoshoot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -106,9 +137,10 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
     try:
         await status.edit_text("🎨 [2/3] Накладываю стиль и свет...")
         
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', system_instruction=SYSTEM_INSTRUCTION)
+        # Используем актуальное имя модели
+        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         prompt = [
-            "Merge face from image 1 to style of image 2. High resolution.",
+            "Merge face from image 1 to style of image 2. Preserve identity.",
             {"mime_type": "image/jpeg", "data": bytes(user_face_raw)},
             {"mime_type": "image/jpeg", "data": bytes(style_ref_raw)}
         ]
@@ -116,8 +148,10 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
         response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
         await status.edit_text("📸 [3/3] Финальная ретушь...")
 
-        if response.parts and response.parts[0].inline_data:
-            generated_bytes = response.parts[0].inline_data.data
+        if response.parts and any(part.inline_data for part in response.parts):
+            # Ищем часть с данными изображения
+            img_part = next(part for part in response.parts if part.inline_data)
+            generated_bytes = img_part.inline_data.data
             context.user_data['current_image'] = generated_bytes
             
             await status.delete()
@@ -128,15 +162,14 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
             )
             return EDITING
         else:
-            # ИСПРАВЛЕНИЕ: Используем reply_text вместо edit_text для ReplyKeyboardMarkup
             await status.delete()
-            await update.message.reply_text("❌ Ошибка фильтров ИИ. Попробуй другие фото.", reply_markup=get_main_menu())
+            await update.message.reply_text("❌ ИИ не вернул изображение. Попробуй другие фото.", reply_markup=get_reply_keyboard())
             return ConversationHandler.END
 
     except Exception as e:
         logging.error(f"Gen Error: {e}")
-        await status.delete()
-        await update.message.reply_text(f"❌ Техническая ошибка.", reply_markup=get_main_menu())
+        if "status" in locals(): await status.delete()
+        await update.message.reply_text(f"❌ Ошибка генерации: модель временно недоступна.", reply_markup=get_reply_keyboard())
         return ConversationHandler.END
 
 async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -148,7 +181,7 @@ async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        model = genai.GenerativeModel(model_name='gemini-1.5-pro', system_instruction=SYSTEM_INSTRUCTION)
+        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         prompt = [
             f"Modify this image: {user_edit_prompt}. Keep face identical.",
             {"mime_type": "image/jpeg", "data": bytes(current_image)},
@@ -157,8 +190,9 @@ async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
 
-        if response.parts and response.parts[0].inline_data:
-            generated_bytes = response.parts[0].inline_data.data
+        if response.parts and any(part.inline_data for part in response.parts):
+            img_part = next(part for part in response.parts if part.inline_data)
+            generated_bytes = img_part.inline_data.data
             context.user_data['current_image'] = generated_bytes
             
             await status.delete()
@@ -172,6 +206,7 @@ async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("❌ Не удалось применить правку.", reply_markup=get_editing_options())
             return EDITING
     except Exception as e:
+        logging.error(f"Edit Error: {e}")
         await status.edit_text("❌ Ошибка редактирования.", reply_markup=get_editing_options())
         return EDITING
 
@@ -179,24 +214,21 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.clear()
-    # Удаляем сообщение с инлайн кнопкой и отправляем новое с обычным меню
     await query.message.delete()
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="Процесс остановлен. Начнем заново?",
-        reply_markup=get_main_menu()
+        reply_markup=get_reply_keyboard()
     )
     return ConversationHandler.END
-
-# --- 5. ЗАПУСК ---
 
 if __name__ == '__main__':
     token = os.getenv("TG_TOKEN")
     if not token:
-        print("Ошибка: TG_TOKEN не найден в переменных окружения!")
         exit(1)
 
     app = ApplicationBuilder().token(token).build()
+    app.add_handler(CallbackQueryHandler(start_chat_callback, pattern="start_chat_flow"))
     
     conv = ConversationHandler(
         entry_points=[
@@ -221,5 +253,5 @@ if __name__ == '__main__':
     )
     
     app.add_handler(conv)
-    print("Бот запущен!")
+    print(f"Бот запущен! Используется модель: {MODEL_NAME}")
     app.run_polling()
