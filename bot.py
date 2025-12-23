@@ -56,12 +56,17 @@ logger = logging.getLogger(__name__)
 genai.configure(api_key=os.getenv("GEMINI_KEY"))
 MODEL_NAME = 'gemini-1.5-flash'
 
+# Оптимизированная системная инструкция
 SYSTEM_INSTRUCTION = (
-    "You are a professional AI Photo Editor. "
-    "Merge the face from Image 1 into Image 2's style. "
-    "Maintain facial identity exactly. High-quality cinematic output."
+    "You are a professional AI Portrait Artist and Digital Compositor. "
+    "Your goal is to create an artistic photographic composition. "
+    "Task: Take the facial features and identity from Image 1 and integrate them "
+    "seamlessly into the scene, lighting, and costume style of Image 2. "
+    "Ensure the final result looks like a high-end cinematic portrait. "
+    "Always prioritize maintaining the recognizable face of the person from Image 1."
 )
 
+# Максимально мягкие настройки безопасности
 SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -77,11 +82,9 @@ def process_image_size(image_bytes, max_size=(1024, 1024)):
     """Оптимизирует размер изображения для стабильной работы API и экономии памяти"""
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        # Конвертируем в RGB если нужно (для поддержки PNG/WebP)
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
         
-        # Пропорциональное уменьшение
         img.thumbnail(max_size, Image.Resampling.LANCZOS)
         
         output = io.BytesIO()
@@ -117,7 +120,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     welcome_text = (
         "👋 Добро пожаловать в ИИ-фотостудию!\n\n"
-        "Я могу перенести твое лицо на любой образ. Используй Mini App или общайся здесь."
+        "Я перенесу твое лицо на любой образ. Используй Mini App или общайся здесь."
     )
     await update.message.reply_text(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
     return ConversationHandler.END
@@ -150,7 +153,6 @@ async def get_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return USER_PHOTO
         
     raw_data = await photo_file.download_as_bytearray()
-    # Сжимаем перед сохранением в память
     context.user_data['user_face'] = process_image_size(raw_data)
     
     await update.message.reply_text(
@@ -179,13 +181,25 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
         await status.edit_text("🎨 Генерирую образ...")
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         
+        # Промпт стал более описательным и художественным
         prompt = [
-            "Merge face from image 1 to style of image 2. Preserve identity exactly.",
+            "Integrate the face from image 1 into the artistic composition of image 2. "
+            "Match lighting, colors and atmosphere while keeping the person's identity from image 1 clear.",
             {"mime_type": "image/jpeg", "data": bytes(user_face_raw)},
             {"mime_type": "image/jpeg", "data": bytes(style_ref_raw)}
         ]
         
         response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
+
+        # Проверка на блокировку контента
+        if response.candidates and response.candidates[0].finish_reason == 3: # SAFETY
+            await status.delete()
+            await update.message.reply_text(
+                "❌ ИИ заблокировал создание этого фото по соображениям безопасности (слишком реалистично или цензура). "
+                "Попробуйте другие фото.", 
+                reply_markup=get_reply_keyboard()
+            )
+            return ConversationHandler.END
 
         if response.parts and any(part.inline_data for part in response.parts):
             img_part = next(part for part in response.parts if part.inline_data)
@@ -201,13 +215,19 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
             return EDITING
         else:
             await status.delete()
-            await update.message.reply_text("❌ ИИ не смог создать фото. Попробуйте другой референс.", reply_markup=get_reply_keyboard())
+            await update.message.reply_text(
+                "❌ ИИ не смог создать фото. Возможно, фото слишком сложное для обработки. Попробуйте другой референс.", 
+                reply_markup=get_reply_keyboard()
+            )
             return ConversationHandler.END
 
     except Exception as e:
         logger.error(f"Gen Error: {e}")
         if "status" in locals(): await status.delete()
-        await update.message.reply_text("❌ Ошибка генерации. Попробуйте еще раз с другими фото.", reply_markup=get_reply_keyboard())
+        await update.message.reply_text(
+            "❌ Произошла ошибка. Попробуйте отправить фото еще раз или выберите изображения другого формата.", 
+            reply_markup=get_reply_keyboard()
+        )
         return ConversationHandler.END
 
 async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,7 +241,7 @@ async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         prompt = [
-            f"Modify this image: {user_edit_prompt}. Keep face identical.",
+            f"Modify the portrait as requested: {user_edit_prompt}. Do not change the person's face.",
             {"mime_type": "image/jpeg", "data": bytes(current_image)},
             {"mime_type": "image/jpeg", "data": bytes(original_face)}
         ]
@@ -241,7 +261,7 @@ async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return EDITING
         else:
-            await status.edit_text("❌ Не удалось применить правку.", reply_markup=get_editing_options())
+            await status.edit_text("❌ Не удалось применить правку. Опишите изменение по-другому.", reply_markup=get_editing_options())
             return EDITING
     except Exception as e:
         logger.error(f"Edit Error: {e}")
