@@ -6,6 +6,7 @@ import threading
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import google.generativeai as genai
+from PIL import Image # Потребуется pip install Pillow
 from telegram import (
     Update, 
     InlineKeyboardButton, 
@@ -70,6 +71,26 @@ SAFETY_SETTINGS = [
 
 USER_PHOTO, STYLE_PHOTO, EDITING = range(3)
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+def process_image_size(image_bytes, max_size=(1024, 1024)):
+    """Оптимизирует размер изображения для стабильной работы API и экономии памяти"""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        # Конвертируем в RGB если нужно (для поддержки PNG/WebP)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        
+        # Пропорциональное уменьшение
+        img.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        output = io.BytesIO()
+        img.save(output, format="JPEG", quality=85, optimize=True)
+        return output.getvalue()
+    except Exception as e:
+        logger.error(f"Ошибка при сжатии фото: {e}")
+        return image_bytes
+
 # --- 3. КЛАВИАТУРЫ ---
 
 def get_main_menu():
@@ -102,8 +123,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Простая команда для проверки связи"""
-    await update.message.reply_text("🏓 Понг! Бот активен и готов к работе.")
+    await update.message.reply_text("🏓 Понг! Бот активен.")
 
 async def start_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -129,7 +149,10 @@ async def get_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, пришли именно изображение.")
         return USER_PHOTO
         
-    context.user_data['user_face'] = await photo_file.download_as_bytearray()
+    raw_data = await photo_file.download_as_bytearray()
+    # Сжимаем перед сохранением в память
+    context.user_data['user_face'] = process_image_size(raw_data)
+    
     await update.message.reply_text(
         "✅ Лицо сохранено!\n\n**Шаг 2:** Теперь пришли фото-референс (образ).",
         reply_markup=get_cancel_inline()
@@ -145,7 +168,8 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("Нужно прислать фото стиля.")
         return STYLE_PHOTO
 
-    style_ref_raw = await photo_file.download_as_bytearray()
+    raw_style_data = await photo_file.download_as_bytearray()
+    style_ref_raw = process_image_size(raw_style_data)
     user_face_raw = context.user_data.get('user_face')
     
     status = await update.message.reply_text("🔍 Анализирую черты лица...")
@@ -156,7 +180,7 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         
         prompt = [
-            "Merge face from image 1 to style of image 2. Preserve identity exactly. High detail.",
+            "Merge face from image 1 to style of image 2. Preserve identity exactly.",
             {"mime_type": "image/jpeg", "data": bytes(user_face_raw)},
             {"mime_type": "image/jpeg", "data": bytes(style_ref_raw)}
         ]
@@ -183,7 +207,7 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         logger.error(f"Gen Error: {e}")
         if "status" in locals(): await status.delete()
-        await update.message.reply_text("❌ Ошибка генерации. Попробуйте фото меньшего размера.", reply_markup=get_reply_keyboard())
+        await update.message.reply_text("❌ Ошибка генерации. Попробуйте еще раз с другими фото.", reply_markup=get_reply_keyboard())
         return ConversationHandler.END
 
 async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,7 +263,6 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- 5. ОСНОВНОЙ ЗАПУСК ---
 
 if __name__ == '__main__':
-    # Сначала запускаем Health Check в отдельном потоке
     threading.Thread(target=run_health_check, daemon=True).start()
 
     token = os.getenv("TG_TOKEN", "").strip().replace('"', '').replace("'", "")
@@ -249,14 +272,12 @@ if __name__ == '__main__':
         sys.exit(1)
 
     try:
-        # Быстрая проверка API Gemini перед стартом
         logger.info("Проверка доступности моделей Gemini...")
         genai.list_models()
         logger.info("API Gemini успешно авторизован.")
 
         app = ApplicationBuilder().token(token).build()
         
-        # Регистрация обработчиков
         app.add_handler(CommandHandler('ping', ping))
         app.add_handler(CallbackQueryHandler(start_chat_callback, pattern="start_chat_flow"))
         
@@ -284,7 +305,7 @@ if __name__ == '__main__':
         
         app.add_handler(conv)
         
-        logger.info("Бот готов к работе. Начинаю опрос (polling)...")
+        logger.info("Бот готов к работе.")
         app.run_polling(drop_pending_updates=True)
         
     except Exception as e:
