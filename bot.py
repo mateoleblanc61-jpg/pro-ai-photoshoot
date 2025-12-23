@@ -37,17 +37,21 @@ def run_health_check():
 
 threading.Thread(target=run_health_check, daemon=True).start()
 
-# --- 2. КОНФИГУРАЦИЯ ---
+# --- 2. КОНФИГУРАЦИЯ И РАБОТА С ОГРАНИЧЕНИЯМИ (РФ) ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Если вы запускаете бота локально в России, раскомментируйте строки ниже 
+# и укажите свой прокси (например, от вашего VPN):
+# os.environ['HTTPS_PROXY'] = 'http://username:password@proxy_address:port'
+# os.environ['HTTP_PROXY'] = 'http://username:password@proxy_address:port'
+
 genai.configure(api_key=os.getenv("GEMINI_KEY"))
 
-# Список приоритетных моделей. Если первая выдаст 404, можно попробовать другие.
-# Основная стабильная модель сейчас: 'gemini-1.5-flash'
+# Модель flash быстрее и стабильнее
 MODEL_NAME = 'gemini-1.5-flash'
 
 SYSTEM_INSTRUCTION = (
@@ -148,7 +152,6 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
     try:
         await status.edit_text("🎨 [2/3] Накладываю стиль и свет...")
         
-        # Пересоздаем модель для каждого запроса, чтобы избежать проблем с сессиями
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         
         prompt = [
@@ -157,7 +160,6 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
             {"mime_type": "image/jpeg", "data": bytes(style_ref_raw)}
         ]
         
-        # Вызов Gemini
         response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
         await status.edit_text("📸 [3/3] Финальная ретушь...")
 
@@ -175,20 +177,21 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
             return EDITING
         else:
             await status.delete()
-            await update.message.reply_text("❌ ИИ не смог создать фото (возможно, сработали фильтры).", reply_markup=get_reply_keyboard())
+            await update.message.reply_text("❌ ИИ не смог создать фото (возможно, из-за фильтров безопасности).", reply_markup=get_reply_keyboard())
             return ConversationHandler.END
 
     except Exception as e:
         logger.error(f"Gen Error: {e}")
-        # Если модель не найдена, выводим список доступных в логи для отладки
-        if "404" in str(e):
-            logger.error("AVAILABLE MODELS CHECK:")
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    logger.error(f"Name: {m.name}")
+        
+        # Обработка ошибки региональных ограничений
+        error_msg = "❌ Техническая ошибка API."
+        if "403" in str(e) or "User location is not supported" in str(e):
+            error_msg = "❌ Ошибка: Сервис Gemini недоступен в вашем регионе без прокси."
+        elif "404" in str(e):
+            error_msg = "❌ Ошибка: Модель не найдена. Проверьте настройки API."
 
         if "status" in locals(): await status.delete()
-        await update.message.reply_text(f"❌ Техническая ошибка API. Попробуйте еще раз.", reply_markup=get_reply_keyboard())
+        await update.message.reply_text(error_msg, reply_markup=get_reply_keyboard())
         return ConversationHandler.END
 
 async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
