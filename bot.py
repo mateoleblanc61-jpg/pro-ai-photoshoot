@@ -1,10 +1,11 @@
 import os
 import logging
 import io
+import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -15,133 +16,214 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# --- 1. ФИКС ДЛЯ RENDER (Health Check Server) ---
-# Этот блок создает мини-сайт, который говорит Render: "Я работаю!"
+# --- 1. ВЕБ-СЕРВЕР ДЛЯ RENDER.COM (Health Check) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is active and running!")
+        self.wfile.write(b"AI Professional Photographer is LIVE")
 
-def run_health_check_server():
-    port = int(os.getenv("PORT", 10000)) # Render сам передает порт
+def run_health_check():
+    port = int(os.getenv("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.serve_forever()
 
-# Запускаем сервер в фоновом потоке, чтобы он не мешал боту
-threading.Thread(target=run_health_check_server, daemon=True).start()
+threading.Thread(target=run_health_check, daemon=True).start()
 
-# --- 2. НАСТРОЙКИ ИИ ---
+# --- 2. КОНФИГУРАЦИЯ ИИ GEMINI ---
 logging.basicConfig(level=logging.INFO)
 genai.configure(api_key=os.getenv("GEMINI_KEY"))
-MODEL_NAME = "gemini-3-pro-image-preview"
+
+# Системная установка для ИИ
+SYSTEM_INSTRUCTION = (
+    "You are a professional AI Photo Editor and Compositor. "
+    "Task 1 (Creation): You take Image 1 (User Face) and Image 2 (Target Style) and merge them. "
+    "Task 2 (Editing): You take an existing image and apply text-based edits. "
+    "CRITICAL: Always maintain the EXACT facial identity and features of the user from the reference. "
+    "Output must be a high-quality cinematic photograph in JPEG format."
+)
+
+SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
 
 # Состояния диалога
-SELECT_STYLE, SEND_PHOTO = range(2)
+USER_PHOTO, STYLE_PHOTO, EDITING = range(3)
 
-# Стили для фотосессий
-STYLES = {
-    "viking": "Viking warrior in snow mountains, cinematic lighting, fur armor, photorealistic, 8k",
-    "cyber": "Cyberpunk character in Tokyo neon streets, techwear, rainy night, high contrast",
-    "business": "Professional business portrait, luxury office background, soft studio lighting",
-    "old_money": "Aristocratic aesthetic, luxury library, tailored blazer, film grain, 35mm lens",
-    "marvel": "Superhero cinematic shot, dramatic pose, epic clouds background, marvel movie style"
-}
+# --- 3. ИНТЕРФЕЙС (КНОПКИ) ---
 
-# --- 3. ЛОГИКА БОТА ---
+def get_main_menu():
+    """Кнопка внизу экрана"""
+    return ReplyKeyboardMarkup([['🚀 Начать фотосессию']], resize_keyboard=True)
+
+def get_cancel_inline():
+    """Инлайн-кнопка под сообщением во время процесса"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_action")]])
+
+def get_editing_options():
+    """Инлайн-кнопка под готовым результатом"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Начать всё заново", callback_data="restart_action")]])
+
+# --- 4. ЛОГИКА БОТА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("⚔️ Викинг", callback_data="viking"), 
-         InlineKeyboardButton("🌃 Киберпанк", callback_data="cyber")],
-        [InlineKeyboardButton("💼 Бизнес", callback_data="business"), 
-         InlineKeyboardButton("💎 Old Money", callback_data="old_money")],
-        [InlineKeyboardButton("🦸 Marvel", callback_data="marvel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите стиль для ИИ-фотосессии:", reply_markup=reply_markup)
-    return SELECT_STYLE
+    """Начало работы"""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "👋 Добро пожаловать в ИИ-фотостудию!\n\n"
+        "Я могу перенести твоё лицо на любое фото или создать образ с нуля.",
+        reply_markup=get_main_menu()
+    )
+    return ConversationHandler.END
 
-async def style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['style'] = STYLES[query.data]
-    await query.edit_message_text("Отлично! Теперь пришли мне своё фото (селфи).")
-    return SEND_PHOTO
+async def init_photoshoot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск процесса после нажатия кнопки"""
+    await update.message.reply_text(
+        "📸 **Шаг 1:** Пришли мне СВОЁ фото (лицо крупным планом).",
+        reply_markup=get_cancel_inline()
+    )
+    return USER_PHOTO
 
-async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        await update.message.reply_text("Пожалуйста, отправь фото.")
-        return SEND_PHOTO
-
-    status = await update.message.reply_text("⏳ Магия началась... Генерирую фото (30-60 сек)")
+async def get_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение лица пользователя"""
+    photo_file = await update.message.photo[-1].get_file()
+    context.user_data['user_face'] = await photo_file.download_as_bytearray()
     
+    await update.message.reply_text(
+        "✅ Лицо сохранено!\n\n"
+        "**Шаг 2:** Теперь пришли фото-референс (образ, который хочешь примерить).",
+        reply_markup=get_cancel_inline()
+    )
+    return STYLE_PHOTO
+
+async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Первая генерация по двум фото"""
+    photo_file = await update.message.photo[-1].get_file()
+    style_ref_raw = await photo_file.download_as_bytearray()
+    
+    user_face_raw = context.user_data.get('user_face')
+    
+    # Индикация прогресса
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    status = await update.message.reply_text("🔍 [1/3] Анализирую черты лица...")
+
     try:
-        # 1. Скачиваем фото
-        photo_file = await update.message.photo[-1].get_file()
-        image_data_raw = await photo_file.download_as_bytearray()
+        await asyncio.sleep(1)
+        await status.edit_text("🎨 [2/3] Накладываю стиль и свет...")
         
-        # 2. Преобразуем bytearray в bytes (Исправление ошибки!)
-        image_bytes = bytes(image_data_raw)
-        
-        # 3. Настройка модели
-        model = genai.GenerativeModel('gemini-1.5-pro') 
-        style_prompt = context.user_data.get('style', "High quality portrait")
-        
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', system_instruction=SYSTEM_INSTRUCTION)
         prompt = [
-            f"Transform the person in this photo into: {style_prompt}. "
-            "Keep the facial features and identity identical. Output the result as an image.",
-            {"mime_type": "image/jpeg", "data": image_bytes}
+            "Merge the face from the first image into the second image's style and scene. Preserve identity.",
+            {"mime_type": "image/jpeg", "data": bytes(user_face_raw)},
+            {"mime_type": "image/jpeg", "data": bytes(style_ref_raw)}
         ]
         
-        # Настройки безопасности (чтобы не блокировал лица)
-        safety = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        ]
+        # Выполнение в потоке, чтобы не вешать бота
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
 
-        # 4. Запрос к ИИ
-        response = model.generate_content(prompt, safety_settings=safety)
+        await status.edit_text("📸 [3/3] Финальная ретушь...")
 
-        # 5. Проверка результата
-        if response.parts:
-            # Ищем часть с данными изображения
-            for part in response.parts:
-                if part.inline_data:
-                    generated_img = io.BytesIO(part.inline_data.data)
-                    await status.delete()
-                    await update.message.reply_photo(photo=generated_img, caption="Готово! Хочешь еще? /start")
-                    return ConversationHandler.END
+        if response.parts and response.parts[0].inline_data:
+            generated_bytes = response.parts[0].inline_data.data
+            context.user_data['current_image'] = generated_bytes # Сохраняем для правок
             
-            await status.edit_text("❌ ИИ прислал ответ, но в нем нет картинки. Попробуй другой стиль.")
+            image_stream = io.BytesIO(generated_bytes)
+            await status.delete()
+            await update.message.reply_photo(
+                photo=image_stream, 
+                caption="✨ Готово! Твой образ создан.\n\n"
+                        "💬 Напиши правку текстом (например: 'сделай костюм красным') или нажми кнопку ниже.",
+                reply_markup=get_editing_options()
+            )
+            return EDITING
         else:
-            await status.edit_text("❌ Ошибка: Модель заблокировала запрос или не смогла сгенерировать фото.")
+            await status.edit_text("❌ ИИ не смог обработать фото из-за фильтров. Попробуй другие фото.", reply_markup=get_main_menu())
+            return ConversationHandler.END
 
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        await status.edit_text(f"❌ Техническая ошибка: {str(e)[:100]}")
-    
+        logging.error(f"Gen Error: {e}")
+        await status.edit_text(f"❌ Техническая ошибка: {str(e)[:50]}...", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Цикл текстовых правок"""
+    user_edit_prompt = update.message.text
+    current_image = context.user_data.get('current_image')
+    original_face = context.user_data.get('user_face')
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    status = await update.message.reply_text(f"🔧 Вношу правку: '{user_edit_prompt}'...")
+
+    try:
+        model = genai.GenerativeModel(model_name='gemini-1.5-pro', system_instruction=SYSTEM_INSTRUCTION)
+        prompt = [
+            f"Modify this image: {user_edit_prompt}. Keep the person's face identical to the reference.",
+            {"mime_type": "image/jpeg", "data": bytes(current_image)},
+            {"mime_type": "image/jpeg", "data": bytes(original_face)}
+        ]
+        
+        response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
+
+        if response.parts and response.parts[0].inline_data:
+            generated_bytes = response.parts[0].inline_data.data
+            context.user_data['current_image'] = generated_bytes
+            
+            image_stream = io.BytesIO(generated_bytes)
+            await status.delete()
+            await update.message.reply_photo(
+                photo=image_stream, 
+                caption="✅ Изменено! Что-то еще?",
+                reply_markup=get_editing_options()
+            )
+            return EDITING
+        else:
+            await status.edit_text("❌ Не удалось применить правку. Опиши по-другому.", reply_markup=get_editing_options())
+            return EDITING
+
+    except Exception as e:
+        logging.error(f"Edit Error: {e}")
+        await status.edit_text("❌ Ошибка при редактировании.", reply_markup=get_editing_options())
+        return EDITING
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сброс и возврат в меню"""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.message.reply_text("Процесс остановлен. Начнем заново?", reply_markup=get_main_menu())
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.")
-    return ConversationHandler.END
+# --- 5. ЗАПУСК ПРИЛОЖЕНИЯ ---
 
 if __name__ == '__main__':
-    token = os.getenv("TG_TOKEN")
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(os.getenv("TG_TOKEN")).build()
     
     conv = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[
+            CommandHandler('start', start),
+            MessageHandler(filters.Text("🚀 Начать фотосессию"), init_photoshoot)
+        ],
         states={
-            SELECT_STYLE: [CallbackQueryHandler(style_callback)],
-            SEND_PHOTO: [MessageHandler(filters.PHOTO, process_photo)],
+            USER_PHOTO: [
+                MessageHandler(filters.PHOTO, get_user_photo),
+                CallbackQueryHandler(cancel_callback, pattern="cancel_action")
+            ],
+            STYLE_PHOTO: [
+                MessageHandler(filters.PHOTO, generate_initial_transfer),
+                CallbackQueryHandler(cancel_callback, pattern="cancel_action")
+            ],
+            EDITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_text),
+                CallbackQueryHandler(cancel_callback, pattern="restart_action")
+            ],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler('start', start), CallbackQueryHandler(cancel_callback)],
     )
     
     app.add_handler(conv)
-    print("Бот запущен...")
+    print("Бот успешно развернут!")
     app.run_polling()
