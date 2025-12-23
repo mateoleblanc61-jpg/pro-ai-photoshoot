@@ -23,7 +23,7 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK (RENDER.COM) ---
+# --- 1. ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -38,10 +38,16 @@ def run_health_check():
 threading.Thread(target=run_health_check, daemon=True).start()
 
 # --- 2. КОНФИГУРАЦИЯ ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 genai.configure(api_key=os.getenv("GEMINI_KEY"))
 
-# Используем gemini-1.5-flash для стабильности и скорости
+# Список приоритетных моделей. Если первая выдаст 404, можно попробовать другие.
+# Основная стабильная модель сейчас: 'gemini-1.5-flash'
 MODEL_NAME = 'gemini-1.5-flash'
 
 SYSTEM_INSTRUCTION = (
@@ -81,13 +87,13 @@ def get_editing_options():
 # --- 4. ЛОГИКА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("User %s started the bot", update.effective_user.id)
     context.user_data.clear()
     web_app_url = os.getenv("WEBAPP_URL", "https://your-mini-app-url.vercel.app")
     
     welcome_text = (
         "👋 Добро пожаловать в ИИ-фотостудию!\n\n"
-        "Вы можете использовать наш современный **Mini App** для удобной загрузки "
-        "или продолжить прямо здесь, в чате."
+        "Я могу перенести твое лицо на любой образ. Используй Mini App для удобства или общайся со мной здесь."
     )
     
     await update.message.reply_text(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
@@ -97,7 +103,7 @@ async def start_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     await query.message.reply_text(
-        "Окей, работаем в чате! Нажми кнопку ниже или пришли фото своего лица.",
+        "Окей! Нажми кнопку ниже, чтобы начать загрузку фото.",
         reply_markup=get_reply_keyboard()
     )
 
@@ -109,13 +115,15 @@ async def init_photoshoot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return USER_PHOTO
 
 async def get_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        await update.message.reply_text("Пожалуйста, пришли именно фото.")
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        photo_file = await update.message.document.get_file()
+    else:
+        await update.message.reply_text("Пожалуйста, пришли именно изображение.")
         return USER_PHOTO
         
-    photo_file = await update.message.photo[-1].get_file()
     context.user_data['user_face'] = await photo_file.download_as_bytearray()
-    
     await update.message.reply_text(
         "✅ Лицо сохранено!\n\n**Шаг 2:** Теперь пришли фото-референс (образ).",
         reply_markup=get_cancel_inline()
@@ -123,11 +131,14 @@ async def get_user_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return STYLE_PHOTO
 
 async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        await update.message.reply_text("Нужно фото стиля.")
+    if update.message.photo:
+        photo_file = await update.message.photo[-1].get_file()
+    elif update.message.document and update.message.document.mime_type.startswith('image/'):
+        photo_file = await update.message.document.get_file()
+    else:
+        await update.message.reply_text("Нужно прислать фото стиля.")
         return STYLE_PHOTO
 
-    photo_file = await update.message.photo[-1].get_file()
     style_ref_raw = await photo_file.download_as_bytearray()
     user_face_raw = context.user_data.get('user_face')
     
@@ -137,19 +148,20 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
     try:
         await status.edit_text("🎨 [2/3] Накладываю стиль и свет...")
         
-        # Используем актуальное имя модели
+        # Пересоздаем модель для каждого запроса, чтобы избежать проблем с сессиями
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
+        
         prompt = [
-            "Merge face from image 1 to style of image 2. Preserve identity.",
+            "Merge face from image 1 to style of image 2. Preserve identity exactly.",
             {"mime_type": "image/jpeg", "data": bytes(user_face_raw)},
             {"mime_type": "image/jpeg", "data": bytes(style_ref_raw)}
         ]
         
+        # Вызов Gemini
         response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
         await status.edit_text("📸 [3/3] Финальная ретушь...")
 
         if response.parts and any(part.inline_data for part in response.parts):
-            # Ищем часть с данными изображения
             img_part = next(part for part in response.parts if part.inline_data)
             generated_bytes = img_part.inline_data.data
             context.user_data['current_image'] = generated_bytes
@@ -163,13 +175,20 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
             return EDITING
         else:
             await status.delete()
-            await update.message.reply_text("❌ ИИ не вернул изображение. Попробуй другие фото.", reply_markup=get_reply_keyboard())
+            await update.message.reply_text("❌ ИИ не смог создать фото (возможно, сработали фильтры).", reply_markup=get_reply_keyboard())
             return ConversationHandler.END
 
     except Exception as e:
-        logging.error(f"Gen Error: {e}")
+        logger.error(f"Gen Error: {e}")
+        # Если модель не найдена, выводим список доступных в логи для отладки
+        if "404" in str(e):
+            logger.error("AVAILABLE MODELS CHECK:")
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    logger.error(f"Name: {m.name}")
+
         if "status" in locals(): await status.delete()
-        await update.message.reply_text(f"❌ Ошибка генерации: модель временно недоступна.", reply_markup=get_reply_keyboard())
+        await update.message.reply_text(f"❌ Техническая ошибка API. Попробуйте еще раз.", reply_markup=get_reply_keyboard())
         return ConversationHandler.END
 
 async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,8 +225,8 @@ async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("❌ Не удалось применить правку.", reply_markup=get_editing_options())
             return EDITING
     except Exception as e:
-        logging.error(f"Edit Error: {e}")
-        await status.edit_text("❌ Ошибка редактирования.", reply_markup=get_editing_options())
+        logger.error(f"Edit Error: {e}")
+        await status.edit_text("❌ Ошибка при редактировании.", reply_markup=get_editing_options())
         return EDITING
 
 async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,6 +244,7 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     token = os.getenv("TG_TOKEN")
     if not token:
+        logger.error("TG_TOKEN is missing!")
         exit(1)
 
     app = ApplicationBuilder().token(token).build()
@@ -237,11 +257,11 @@ if __name__ == '__main__':
         ],
         states={
             USER_PHOTO: [
-                MessageHandler(filters.PHOTO, get_user_photo),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, get_user_photo),
                 CallbackQueryHandler(cancel_callback, pattern="cancel_action")
             ],
             STYLE_PHOTO: [
-                MessageHandler(filters.PHOTO, generate_initial_transfer),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, generate_initial_transfer),
                 CallbackQueryHandler(cancel_callback, pattern="cancel_action")
             ],
             EDITING: [
@@ -253,5 +273,5 @@ if __name__ == '__main__':
     )
     
     app.add_handler(conv)
-    print(f"Бот запущен! Используется модель: {MODEL_NAME}")
+    logger.info("Bot started successfully. Model: %s", MODEL_NAME)
     app.run_polling()
