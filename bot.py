@@ -3,6 +3,7 @@ import logging
 import io
 import asyncio
 import threading
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import google.generativeai as genai
 from telegram import (
@@ -23,35 +24,36 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# --- 1. ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK ---
+# --- 1. ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK (RENDER.COM) ---
+# Убеждаемся, что сервер отвечает на запросы Render максимально быстро
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b"AI Professional Photographer is LIVE")
+    
+    def log_message(self, format, *args):
+        return # Отключаем лишние логи сервера в консоли
 
 def run_health_check():
     port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+    logger.info(f"Запуск Health Check сервера на порту {port}...")
+    try:
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Ошибка Health Check сервера: {e}")
 
-threading.Thread(target=run_health_check, daemon=True).start()
-
-# --- 2. КОНФИГУРАЦИЯ И РАБОТА С ОГРАНИЧЕНИЯМИ (РФ) ---
+# --- 2. КОНФИГУРАЦИЯ ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Если вы запускаете бота локально в России, раскомментируйте строки ниже 
-# и укажите свой прокси (например, от вашего VPN):
-# os.environ['HTTPS_PROXY'] = 'http://username:password@proxy_address:port'
-# os.environ['HTTP_PROXY'] = 'http://username:password@proxy_address:port'
-
+# Настройка Gemini
 genai.configure(api_key=os.getenv("GEMINI_KEY"))
-
-# Модель flash быстрее и стабильнее
 MODEL_NAME = 'gemini-1.5-flash'
 
 SYSTEM_INSTRUCTION = (
@@ -91,15 +93,12 @@ def get_editing_options():
 # --- 4. ЛОГИКА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("User %s started the bot", update.effective_user.id)
+    logger.info(f"User {update.effective_user.id} started the bot")
     context.user_data.clear()
-    web_app_url = os.getenv("WEBAPP_URL", "https://your-mini-app-url.vercel.app")
-    
     welcome_text = (
         "👋 Добро пожаловать в ИИ-фотостудию!\n\n"
-        "Я могу перенести твое лицо на любой образ. Используй Mini App для удобства или общайся со мной здесь."
+        "Я могу перенести твое лицо на любой образ. Используй Mini App или общайся здесь."
     )
-    
     await update.message.reply_text(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -146,12 +145,11 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
     style_ref_raw = await photo_file.download_as_bytearray()
     user_face_raw = context.user_data.get('user_face')
     
-    status = await update.message.reply_text("🔍 [1/3] Анализирую черты лица...")
+    status = await update.message.reply_text("🔍 Анализирую черты лица...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
 
     try:
-        await status.edit_text("🎨 [2/3] Накладываю стиль и свет...")
-        
+        await status.edit_text("🎨 Генерирую образ...")
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         
         prompt = [
@@ -161,7 +159,6 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
         ]
         
         response = await asyncio.to_thread(model.generate_content, prompt, safety_settings=SAFETY_SETTINGS)
-        await status.edit_text("📸 [3/3] Финальная ретушь...")
 
         if response.parts and any(part.inline_data for part in response.parts):
             img_part = next(part for part in response.parts if part.inline_data)
@@ -171,27 +168,19 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
             await status.delete()
             await update.message.reply_photo(
                 photo=io.BytesIO(generated_bytes), 
-                caption="✨ Готово! Напиши правку текстом или нажми кнопку ниже.",
+                caption="✨ Готово! Напиши правку или нажми кнопку ниже.",
                 reply_markup=get_editing_options()
             )
             return EDITING
         else:
             await status.delete()
-            await update.message.reply_text("❌ ИИ не смог создать фото (возможно, из-за фильтров безопасности).", reply_markup=get_reply_keyboard())
+            await update.message.reply_text("❌ ИИ не смог создать фото. Попробуйте другой референс.", reply_markup=get_reply_keyboard())
             return ConversationHandler.END
 
     except Exception as e:
         logger.error(f"Gen Error: {e}")
-        
-        # Обработка ошибки региональных ограничений
-        error_msg = "❌ Техническая ошибка API."
-        if "403" in str(e) or "User location is not supported" in str(e):
-            error_msg = "❌ Ошибка: Сервис Gemini недоступен в вашем регионе без прокси."
-        elif "404" in str(e):
-            error_msg = "❌ Ошибка: Модель не найдена. Проверьте настройки API."
-
         if "status" in locals(): await status.delete()
-        await update.message.reply_text(error_msg, reply_markup=get_reply_keyboard())
+        await update.message.reply_text("❌ Ошибка генерации.", reply_markup=get_reply_keyboard())
         return ConversationHandler.END
 
 async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,7 +209,7 @@ async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.delete()
             await update.message.reply_photo(
                 photo=io.BytesIO(generated_bytes), 
-                caption="✅ Изменено! Что-то еще?",
+                caption="✅ Изменено!",
                 reply_markup=get_editing_options()
             )
             return EDITING
@@ -239,42 +228,56 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.delete()
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="Процесс остановлен. Начнем заново?",
+        text="Процесс остановлен.",
         reply_markup=get_reply_keyboard()
     )
     return ConversationHandler.END
 
-if __name__ == '__main__':
-    token = os.getenv("TG_TOKEN")
-    if not token:
-        logger.error("TG_TOKEN is missing!")
-        exit(1)
+# --- 5. ОСНОВНОЙ ЗАПУСК ---
 
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CallbackQueryHandler(start_chat_callback, pattern="start_chat_flow"))
+if __name__ == '__main__':
+    # Сначала запускаем Health Check в отдельном потоке
+    threading.Thread(target=run_health_check, daemon=True).start()
+
+    token = os.getenv("TG_TOKEN", "").strip().replace('"', '').replace("'", "")
     
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler('start', start),
-            MessageHandler(filters.Text("🚀 Начать фотосессию"), init_photoshoot)
-        ],
-        states={
-            USER_PHOTO: [
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, get_user_photo),
-                CallbackQueryHandler(cancel_callback, pattern="cancel_action")
+    if not token:
+        logger.error("TG_TOKEN не найден!")
+        sys.exit(1)
+
+    try:
+        app = ApplicationBuilder().token(token).build()
+        
+        # Регистрация обработчиков
+        app.add_handler(CallbackQueryHandler(start_chat_callback, pattern="start_chat_flow"))
+        
+        conv = ConversationHandler(
+            entry_points=[
+                CommandHandler('start', start),
+                MessageHandler(filters.Text("🚀 Начать фотосессию"), init_photoshoot)
             ],
-            STYLE_PHOTO: [
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, generate_initial_transfer),
-                CallbackQueryHandler(cancel_callback, pattern="cancel_action")
-            ],
-            EDITING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_text),
-                CallbackQueryHandler(cancel_callback, pattern="restart_action")
-            ],
-        },
-        fallbacks=[CommandHandler('start', start), CallbackQueryHandler(cancel_callback)],
-    )
-    
-    app.add_handler(conv)
-    logger.info("Bot started successfully. Model: %s", MODEL_NAME)
-    app.run_polling()
+            states={
+                USER_PHOTO: [
+                    MessageHandler(filters.PHOTO | filters.Document.IMAGE, get_user_photo),
+                    CallbackQueryHandler(cancel_callback, pattern="cancel_action")
+                ],
+                STYLE_PHOTO: [
+                    MessageHandler(filters.PHOTO | filters.Document.IMAGE, generate_initial_transfer),
+                    CallbackQueryHandler(cancel_callback, pattern="cancel_action")
+                ],
+                EDITING: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_text),
+                    CallbackQueryHandler(cancel_callback, pattern="restart_action")
+                ],
+            },
+            fallbacks=[CommandHandler('start', start), CallbackQueryHandler(cancel_callback)],
+        )
+        
+        app.add_handler(conv)
+        
+        logger.info("Бот готов к работе. Начинаю опрос (polling)...")
+        app.run_polling(drop_pending_updates=True)
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске: {e}")
+        sys.exit(1)
