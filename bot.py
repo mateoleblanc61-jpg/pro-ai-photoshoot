@@ -1,3 +1,19 @@
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Крошечный веб-сервер для обмана Render
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_health_check():
+    server = HTTPServer(('0.0.0.0', int(os.getenv("PORT", 10000))), HealthCheckHandler)
+    server.serve_forever()
+
+# Запускаем сервер в отдельном потоке
+threading.Thread(target=run_health_check, daemon=True).start()
 import os
 import logging
 import io
