@@ -25,7 +25,6 @@ from telegram.ext import (
 )
 
 # --- 1. ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK (RENDER.COM) ---
-# Убеждаемся, что сервер отвечает на запросы Render максимально быстро
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -34,7 +33,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"AI Professional Photographer is LIVE")
     
     def log_message(self, format, *args):
-        return # Отключаем лишние логи сервера в консоли
+        return # Тихий режим для логов сервера
 
 def run_health_check():
     port = int(os.getenv("PORT", 10000))
@@ -102,6 +101,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
     return ConversationHandler.END
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Простая команда для проверки связи"""
+    await update.message.reply_text("🏓 Понг! Бот активен и готов к работе.")
+
 async def start_chat_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -153,7 +156,7 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=SYSTEM_INSTRUCTION)
         
         prompt = [
-            "Merge face from image 1 to style of image 2. Preserve identity exactly.",
+            "Merge face from image 1 to style of image 2. Preserve identity exactly. High detail.",
             {"mime_type": "image/jpeg", "data": bytes(user_face_raw)},
             {"mime_type": "image/jpeg", "data": bytes(style_ref_raw)}
         ]
@@ -180,7 +183,7 @@ async def generate_initial_transfer(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         logger.error(f"Gen Error: {e}")
         if "status" in locals(): await status.delete()
-        await update.message.reply_text("❌ Ошибка генерации.", reply_markup=get_reply_keyboard())
+        await update.message.reply_text("❌ Ошибка генерации. Попробуйте фото меньшего размера.", reply_markup=get_reply_keyboard())
         return ConversationHandler.END
 
 async def process_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -242,13 +245,19 @@ if __name__ == '__main__':
     token = os.getenv("TG_TOKEN", "").strip().replace('"', '').replace("'", "")
     
     if not token:
-        logger.error("TG_TOKEN не найден!")
+        logger.error("КРИТИЧЕСКАЯ ОШИБКА: TG_TOKEN не найден!")
         sys.exit(1)
 
     try:
+        # Быстрая проверка API Gemini перед стартом
+        logger.info("Проверка доступности моделей Gemini...")
+        genai.list_models()
+        logger.info("API Gemini успешно авторизован.")
+
         app = ApplicationBuilder().token(token).build()
         
         # Регистрация обработчиков
+        app.add_handler(CommandHandler('ping', ping))
         app.add_handler(CallbackQueryHandler(start_chat_callback, pattern="start_chat_flow"))
         
         conv = ConversationHandler(
